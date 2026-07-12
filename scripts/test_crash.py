@@ -81,16 +81,28 @@ print("first_pass done")
 u = np.ma.masked_array(u, mask=np.ma.nomask)
 v = np.ma.masked_array(v, mask=np.ma.nomask)
 
-print("running multipass iteration 1...")
-x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
-    frame_a, frame_b, 1, x, y, u, v, settings
-)
-print("multipass iteration 1 done")
+import matplotlib.pyplot as plt
 
-print("u range:", np.nanmin(u), np.nanmax(u))
-print("v range:", np.nanmin(v), np.nanmax(v))
-print("fraction NaN in u:", np.mean(np.isnan(u)))
-print("fraction NaN in v:", np.mean(np.isnan(v)))
+plt.figure(figsize=(8, 8))
+plt.quiver(x, y, u, v)
+plt.title("Displacement Vectors")
+plt.xlabel("X")
+plt.ylabel("Y")
+plt.xlim(0, frame_a.shape[1])
+plt.ylim(0, frame_a.shape[0])
+plt.gca().invert_yaxis()  # Invert y-axis to match image coordinates
+plt.show()
 
-print(np.array_equal(frame_a, frame_b))
-print(frame_a.shape, frame_b.shape)
+# print("running multipass iteration 1...")
+# x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
+#     frame_a, frame_b, 1, x, y, u, v, settings
+# )
+# print("multipass iteration 1 done")
+
+# print("u range:", np.nanmin(u), np.nanmax(u))
+# print("v range:", np.nanmin(v), np.nanmax(v))
+# print("fraction NaN in u:", np.mean(np.isnan(u)))
+# print("fraction NaN in v:", np.mean(np.isnan(v)))
+
+# print(np.array_equal(frame_a, frame_b))
+# print(frame_a.shape, frame_b.shape)
