@@ -40,7 +40,7 @@ settings.num_iterations = 2
 settings.windowsizes = (64, 32, 16)   # Coarse -> fine
 settings.overlap = (32, 16, 8)        # 50% overlap at each pass
 settings.subpixel_method = 'gaussian'
-settings.interpolation_order = 3
+settings.interpolation_order = 1
 settings.scaling_factor = 1
 settings.dt = 1
 
@@ -74,13 +74,15 @@ deformed_stack = tif.imread('/mnt/crunch/Clark/Larva/Larva 4.0 (7-5-26)/Rolling_
 frame_a = reference_stack[0].astype(np.int32)
 frame_b = deformed_stack[0].astype(np.int32)
 
-print("running first_pass on frame 0...")
+print("running first_pass...")
 x, y, u, v, s2n = windef.first_pass(frame_a, frame_b, settings)
-print("frame 0 first_pass done")
+print("first_pass done")
 
-frame_a2 = reference_stack[1].astype(np.int32)
-frame_b2 = deformed_stack[1].astype(np.int32)
+u = np.ma.masked_array(u, mask=np.ma.nomask)
+v = np.ma.masked_array(v, mask=np.ma.nomask)
 
-print("running first_pass on frame 1...")
-x2, y2, u2, v2, s2n2 = windef.first_pass(frame_a2, frame_b2, settings)
-print("frame 1 first_pass done")
+print("running multipass iteration 1...")
+x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
+    frame_a, frame_b, 1, x, y, u, v, settings
+)
+print("multipass iteration 1 done")
