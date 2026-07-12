@@ -40,7 +40,7 @@ settings.num_iterations = 2
 settings.windowsizes = (64, 32, 16)   # Coarse -> fine
 settings.overlap = (32, 16, 8)        # 50% overlap at each pass
 settings.subpixel_method = 'gaussian'
-settings.interpolation_order = 1
+settings.interpolation_order = 3
 settings.scaling_factor = 1
 settings.dt = 1
 
