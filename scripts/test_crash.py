@@ -18,8 +18,8 @@ import tifffile as tif
 settings = windef.PIVSettings()
 
 data_path = '/mnt/crunch/Clark/Larva/Larva 4.0 (7-5-26)/'
-reference_stack_path = 'Rolling_Balled.tif'
-deformed_stack_path = 'reference-rolling_Stack.tif'
+reference_stack_path = 'reference-rolling_Stack.tif'
+deformed_stack_path = 'Rolling_Balled.tif'
 
 # Change image settings to your own data
 settings.filepath_images = pathlib.Path(data_path)
@@ -50,10 +50,10 @@ settings.sig2noise_mask = 2
 settings.validation_first_pass = True
 settings.min_max_u_disp = (-60, 60)
 settings.min_max_v_disp = (-60, 60)
-settings.std_threshold = 8
-settings.median_threshold = 4
+settings.std_threshold = 1000
+settings.median_threshold = 1000
 settings.median_size = 1
-settings.sig2noise_threshold = 1.0
+settings.sig2noise_threshold = 0
 
 settings.replace_vectors = True
 settings.smoothn = True
@@ -86,3 +86,11 @@ x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
     frame_a, frame_b, 1, x, y, u, v, settings
 )
 print("multipass iteration 1 done")
+
+print("u range:", np.nanmin(u), np.nanmax(u))
+print("v range:", np.nanmin(v), np.nanmax(v))
+print("fraction NaN in u:", np.mean(np.isnan(u)))
+print("fraction NaN in v:", np.mean(np.isnan(v)))
+
+print(np.array_equal(frame_a, frame_b))
+print(frame_a.shape, frame_b.shape)
