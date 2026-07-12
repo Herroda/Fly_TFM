@@ -48,12 +48,12 @@ settings.sig2noise_method = 'peak2peak'
 settings.sig2noise_mask = 2
 
 settings.validation_first_pass = True
-settings.min_max_u_disp = (-60, 60)
-settings.min_max_v_disp = (-60, 60)
-settings.std_threshold = 1000
-settings.median_threshold = 1000
+settings.min_max_u_disp = (-10, 10)
+settings.min_max_v_disp = (-10, 10)
+settings.std_threshold = 7
+settings.median_threshold = 3
 settings.median_size = 1
-settings.sig2noise_threshold = 0
+settings.sig2noise_threshold = 1
 
 settings.replace_vectors = True
 settings.smoothn = True
@@ -81,6 +81,28 @@ print("first_pass done")
 u = np.ma.masked_array(u, mask=np.ma.nomask)
 v = np.ma.masked_array(v, mask=np.ma.nomask)
 
+u, v = filters.replace_outliers(
+    u, v,
+    np.isnan(u) | np.isnan(v) if not np.ma.is_masked(u) else u.mask,
+    method='localmean',
+    max_iter=10,
+    kernel_size=2
+)
+
+print("running multipass iteration 1...")
+x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
+    frame_a, frame_b, 1, x, y, u, v, settings
+)
+print("multipass iteration 1 done")
+
+print("u range:", np.nanmin(u), np.nanmax(u))
+print("v range:", np.nanmin(v), np.nanmax(v))
+print("fraction NaN in u:", np.mean(np.isnan(u)))
+print("fraction NaN in v:", np.mean(np.isnan(v)))
+
+print(np.array_equal(frame_a, frame_b))
+print(frame_a.shape, frame_b.shape)
+
 import matplotlib.pyplot as plt
 
 plt.figure(figsize=(8, 8))
@@ -92,17 +114,3 @@ plt.xlim(0, frame_a.shape[1])
 plt.ylim(0, frame_a.shape[0])
 plt.gca().invert_yaxis()  # Invert y-axis to match image coordinates
 plt.show()
-
-# print("running multipass iteration 1...")
-# x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
-#     frame_a, frame_b, 1, x, y, u, v, settings
-# )
-# print("multipass iteration 1 done")
-
-# print("u range:", np.nanmin(u), np.nanmax(u))
-# print("v range:", np.nanmin(v), np.nanmax(v))
-# print("fraction NaN in u:", np.mean(np.isnan(u)))
-# print("fraction NaN in v:", np.mean(np.isnan(v)))
-
-# print(np.array_equal(frame_a, frame_b))
-# print(frame_a.shape, frame_b.shape)
