@@ -1,3 +1,7 @@
+# ==============================================================================
+# 1. IMPORTS
+# ==============================================================================
+
 from openpiv import windef
 from openpiv import tools, scaling, validation, filters, preprocess
 import openpiv.pyprocess as process
@@ -7,24 +11,17 @@ import pathlib
 from time import time
 import warnings
 import tifffile as tif
-
-
 import matplotlib.pyplot as plt
 
-#* SETTINGS
+# ==============================================================================
+# 2. SETTINGS
+# ==============================================================================
 
 settings = windef.PIVSettings()
 
 data_path = '/mnt/crunch/Clark/Larva/Larva 4.0 (7-5-26)/'
 reference_stack_path = 'Rolling_Balled.tif'
 deformed_stack_path = 'reference-rolling_Stack.tif'
-
-# Change image settings to your own data
-settings.filepath_images = pathlib.Path(data_path)
-settings.save_path = pathlib.Path(data_path)
-settings.save_folder_suffix = 'my_run'
-settings.frame_pattern_a = 'frame_a.tif'   # Adjust to your naming
-settings.frame_pattern_b = 'frame_b.tif'   # Adjust to your naming
 
 settings.roi = 'full'
 settings.dynamic_masking_method = 'None'
@@ -64,57 +61,17 @@ settings.save_plot = False
 settings.show_plot = False
 settings.scale_plot = 200
 
+# ==============================================================================
+# 3. ACTUAL PIV
+# ==============================================================================
 
-#* INITIALIZE
+# Load data
+data_path = '/mnt/crunch/Clark/Larva/Larva 4.0 (7-5-26)/'
+reference_stack_name = 'reference-rolling_Stack.tif'
+deformed_stack_name = 'Rolling_Balled.tif'
 
-# Data 
-reference_stack = tif.imread(data_path + reference_stack_path)
-deformed_stack = tif.imread(data_path + deformed_stack_path)
-
-# Results
-results_u = []
-results_v = []
-results_x = None 
-results_y = None 
-
-# n_frames = reference_stack.shape[0]
-n_frames = 10
+reference_stack = tif.imread(data_path + reference_stack_name)
+deformed_stack = tif.imread(data_path + deformed_stack_name)
 
 # ------------------------------------------------------------------------------
 
-#* COMPUTATION
-
-for current_frame in range(n_frames):
-    # Set current slices
-    frame_a = reference_stack[current_frame].astype(np.int32)
-    frame_b = deformed_stack[current_frame].astype(np.int32)
-    
-    # Run the first pass
-    x, y, u, v, sig2noise = windef.first_pass(frame_a, frame_b, settings)
-    
-    # Wrap as masked arrays (required by multipass_img_deform)
-    u = np.ma.masked_array(u, mask=np.ma.nomask)
-    v = np.ma.masked_array(v, mask=np.ma.nomask)
-    
-    # Run subsequent passes
-    for iteration in range(1, settings.num_iterations):
-        x, y, u, v, grid_mask, flags = windef.multipass_img_deform(
-            frame_a, frame_b, iteration, x, y, u, v, settings
-        )
-        
-    # Append results
-    results_u.append(np.array(u))
-    results_v.append(np.array(v))
-    
-    # x and y
-    if results_x is None:
-        results_x , results_y = x, y
-    
-    # Check progress every 50 frames
-    if current_frame % 50 == 0:
-        print(f"frame {current_frame}/{n_frames} done - u range {np.nanmin(u):.2f} to {np.nanmax(u):.2f}")
-        
-results_u = np.array(results_u)  # shape: (571, ny, nx)
-results_v = np.array(results_v)
-
-print("Done. results_u shape:", results_u.shape)
