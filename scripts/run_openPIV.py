@@ -1,20 +1,33 @@
+# %%
+
 # ==============================================================================
-# 1. IMPORTS
+# SECTION 1. IMPORTS
 # ==============================================================================
 
+# OpenPIV
 from openpiv import windef
 from openpiv import tools, scaling, validation, filters, preprocess
 import openpiv.pyprocess as process
 from openpiv import pyprocess
+
+# General
 import numpy as np
-import pathlib
-from time import time
-import warnings
 import tifffile as tif
 import matplotlib.pyplot as plt
 
+import pathlib
+from time import time
+import warnings
+
+# Custom functions
+from PIV import run_PIV_on_frames
+
+# !SECTION
+
+#%%
+
 # ==============================================================================
-# 2. SETTINGS
+# SECTION 2. SETTINGS
 # ==============================================================================
 
 settings = windef.PIVSettings()
@@ -61,17 +74,51 @@ settings.save_plot = False
 settings.show_plot = False
 settings.scale_plot = 200
 
+# !SECTION
+
+#%%
+
 # ==============================================================================
-# 3. ACTUAL PIV
+# SECTION 3. ACTUAL PIV
 # ==============================================================================
 
-# Load data
+# ANCHOR Load data
+
 data_path = '/mnt/crunch/Clark/Larva/Larva 4.0 (7-5-26)/'
 reference_stack_name = 'reference-rolling_Stack.tif'
-deformed_stack_name = 'Rolling_Balled.tif'
+deformed_stack_name = 'Rolling_Balled.tif'  # Has shape (num_slices, height, width)
 
 reference_stack = tif.imread(data_path + reference_stack_name)
 deformed_stack = tif.imread(data_path + deformed_stack_name)
 
 # ------------------------------------------------------------------------------
 
+# ANCHOR Main computation loop
+
+# Initialize variables
+num_frames = deformed_stack.shape[0]
+results_u = []
+results_v = []
+
+# Run main computational loop
+for current_frame in range(1, num_frames):
+    
+    # Set current slices of the stacks
+    current_reference_slice = reference_stack[current_frame]
+    current_deformed_slice = deformed_stack[current_frame]
+    
+    # Run PIV on these slices
+    x, y, u, v, sig2noise, flags = run_PIV_on_frames(current_reference_slice, current_deformed_slice, settings)
+    
+    # Append results to lists
+    results_u.append(np.array(u))
+    results_v.append(np.array(v))
+    
+    # Print progress every 10 frames
+    if current_frame % 10 == 0:
+        print(f'Processed frame {current_frame}/{num_frames}')
+        
+results_u = np.array(results_u)
+results_v = np.array(results_v)
+
+# !SECTION
