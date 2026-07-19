@@ -10,3 +10,5 @@ data/
 
 # Jupyter
 .ipynb_checkpoints/
+
+.DS_Store
