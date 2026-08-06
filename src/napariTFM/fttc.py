@@ -1,0 +1,768 @@
+"""
+Traction Force Microscopy (TFM) force calculation module implementing the FTTC method
+(regularized Fourier inversion) with a manual Tikhonov ?, and dispatch to the sparse group-L1
+and evidence-maximizing Bayesian-L2 (:mod:`napariTFM.backend.bayesian_l2`) solvers. The auto-?
+button (:func:`find_bayesian_regularization`) estimates the Bayesian-L2 ridge on one frame to
+freeze and reuse across the experiment.
+
+Core TFM functions are based on:
+- DirectMethod package (https://github.com/usschwarz/DirectMethod) - MIT License
+- Blumberg & Schwarz, Comparison of direct and inverse methods for 2.5D traction force microscopy (2022)
+  https://doi.org/10.1371/journal.pone.0262773
+
+
+Gel height correction implementation adapted from:
+- pyTFM package (https://github.com/fabrylab/pyTFM) - GNU GPL v3.0 License
+
+Paper references:
+- Butler et al. Traction fields, moments, and strain energy that cells exert on
+  their surroundings (2002)
+- Sabass et al. High resolution traction force microscopy based on experimental and
+  computational advances (2008)
+- Trepat et al. Physical forces during collective cell migration (2009)
+- Huang et al. Traction force microscopy with optimized regularization and automated
+  Bayesian parameter selection for comparing cells, Sci. Rep. 9:539 (2019)
+"""
+
+from dataclasses import dataclass
+from typing import Generator, Optional, Tuple
+
+import numpy as np
+from scipy import optimize
+
+from src.napariTFM.fttc_numba_functions import calculate_traction_2d, blkmul_adj
+from src.napariTFM.parameter_dataclasses import FTTCParameters
+from src.napariTFM.parameter_validation import validate_fttc_parameters
+
+
+@dataclass
+class FTTCResult:
+    """Results from FTTC force calculation."""
+    force_field: np.ndarray
+    original_shape: tuple
+    force_shape: tuple
+    parameters: FTTCParameters
+    physical_scale: dict
+
+
+def validate_displacement_field(displacement_field: np.ndarray) -> Tuple[bool, str]:
+    """Validate displacement field data format and values."""
+    if displacement_field is None:
+        return False, "No displacement field data provided"
+
+    if not isinstance(displacement_field, np.ndarray):
+        return False, "Displacement field must be a numpy array"
+
+    if displacement_field.ndim not in (3, 4):
+        return False, "Displacement field must be 3D (y,x,2) or 4D (t,y,x,2)"
+
+    if displacement_field.shape[-1] != 2:
+        return False, f"Last dimension must be 2 (x,y components), got {displacement_field.shape[-1]}"
+
+    if np.all(np.isnan(displacement_field)):
+        return False, "Displacement field contains only NaN values"
+
+    return True, ""
+
+
+def _mask_frame_for_grid(mask: np.ndarray, frame: int, hw: Tuple[int, int]) -> np.ndarray:
+    """Pick the frame's 2D mask and resize (nearest) it to the force grid ``hw``.
+
+    ``mask`` may be 2D (shared across frames) or 3D ``(T, H, W)``; masks are an
+    external input at bead resolution, so they are resampled to the (downscaled)
+    force grid here, matching how the stress stage fits its mask to the force field.
+    """
+    m = mask[frame] if mask.ndim > 2 else mask
+    m = np.asarray(m) > 0
+    if m.shape != tuple(hw):
+        from skimage.transform import resize
+        m = resize(m.astype(float), hw, order=0, mode="edge",
+                   anti_aliasing=False) > 0.5
+    return m
+
+
+def _force_clip_mask(mask: np.ndarray, frame: int, hw: Tuple[int, int],
+                     reach: float) -> np.ndarray:
+    """Hard support for post-hoc force clipping on the force grid.
+
+    The kept region is the loaded mask dilated outward by ``reach`` force-grid pixels.
+    There is no soft skirt or smoothing: every traction vector outside this support is
+    set to exactly zero after the selected inversion has finished.
+    """
+    support = _mask_frame_for_grid(mask, frame, hw)
+    reach = max(float(reach), 0.0)
+    if reach <= 0.0:
+        return support
+    from scipy import ndimage
+    distance_from_mask = ndimage.distance_transform_edt(~support)
+    return distance_from_mask <= reach
+
+
+def _apply_force_clip(force_frame: np.ndarray, mask: Optional[np.ndarray],
+                      frame: int, params: FTTCParameters) -> np.ndarray:
+    """Apply the Force panel's post-hoc mask clip to one ``(H, W, 2)`` frame."""
+    if mask is None or getattr(params, "fwd_mask_strength", 0.0) <= 0:
+        return force_frame
+    keep = _force_clip_mask(mask, frame, force_frame.shape[:2],
+                            getattr(params, "fwd_mask_reach", 0.0))
+    force_frame[~keep, :] = 0.0
+    return force_frame
+
+
+def infer_force_method(params: FTTCParameters, *, mask_present: bool = False) -> str:
+    """Reproduce the pre-selector routing from the numeric flags (the ``"auto"`` fallback).
+
+    The current ladder is ``l1_sparsity > 0`` ? ``"Elastic net"``; else ``bayesian_l2`` ?
+    ``"Bayesian L2"``; else ``"FTTC + GCV"``. The former mask-confinement solver is no longer
+    selected here; the Force panel's mask controls are a post-hoc output clip.
+    """
+    if params.l1_sparsity > 0:
+        return "Elastic net"
+    if getattr(params, "bayesian_l2", False):
+        return "Bayesian L2"
+    return "FTTC + GCV"
+
+
+def calculate_force_field(
+        displacement_field: np.ndarray,
+        params: FTTCParameters,
+        mask: Optional[np.ndarray] = None,
+) -> Generator[Tuple[np.ndarray, int, int], None, FTTCResult]:
+    """Calculate traction forces from displacement field data.
+
+    The inversion is chosen explicitly by ``params.force_method`` (``"auto"`` reproduces the
+    legacy sentinel routing via :func:`infer_force_method`):
+
+    * ``"Elastic net"`` ? the sparse group-L1 solver (:mod:`napariTFM.backend.forward_l1`).
+      Regularizes with an L1 sparsity prior (thresholds rather than spreads), optionally an
+      elastic-net ``l2_ridge``; needs no mask.
+    * ``"Bayesian L2"`` ? the Bayesian-L2 reconstruction (:mod:`napariTFM.backend.bayesian_l2`):
+      a real-space, standardized, over-determined Tikhonov inversion whose regularization is
+      chosen automatically by evidence maximization. BL2 (? from the cell-free exterior) when a
+      ``mask`` is present, else parameter-free ABL2.
+    * ``"FTTC + GCV"`` ? plain Fourier Tikhonov inversion with the manual ``regularization`` ?,
+      or a per-frame GCV ? when ``auto_gcv`` is set.
+
+    When ``fwd_mask_strength > 0`` and ``mask`` is supplied, the completed force frame is
+    hard-clipped after inversion: vectors outside ``mask`` dilated by ``fwd_mask_reach`` are
+    set to zero. There is no soft confinement or smoothing.
+    """
+    is_valid, error_msg = validate_fttc_parameters(params)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    is_valid, error_msg = validate_displacement_field(displacement_field)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    if displacement_field.ndim == 3:
+        displacement_field = displacement_field[np.newaxis, ...]
+
+    total_frames = displacement_field.shape[0]
+    force_shape = displacement_field.shape[1:4]
+    force_stack = np.zeros((total_frames, *force_shape), dtype=np.float32)
+
+    method = getattr(params, "force_method", "auto")
+    if method == "auto":
+        method = infer_force_method(params, mask_present=mask is not None)
+    use_l1 = method == "Elastic net"
+    use_forward = False
+    use_bayes = method == "Bayesian L2"
+    calculator = None if (use_l1 or use_forward or use_bayes) else FTTC(params)
+
+    for frame in range(total_frames):
+        if use_l1:
+            from src.napariTFM.forward_l1 import l1_traction_frame
+            traction = l1_traction_frame(displacement_field[frame], params, mask=None)
+            force_stack[frame, ..., 0] = traction[0]
+            force_stack[frame, ..., 1] = traction[1]
+        elif use_forward:
+            from src.napariTFM.forward_tfm import forward_traction_frame
+            m = None if mask is None else _mask_frame_for_grid(mask, frame, force_shape[:2])
+            traction = forward_traction_frame(displacement_field[frame], params, mask=m)
+            force_stack[frame, ..., 0] = traction[0]
+            force_stack[frame, ..., 1] = traction[1]
+        elif use_bayes:
+            # Bayesian-L2: a dedicated real-space, standardized, over-determined reconstruction
+            # with evidence-maximizing (automatic) regularization -- NOT a ? fed to FTTC. BL2
+            # (? pinned from the cell-free exterior noise) when a mask is present, else the
+            # parameter-free ABL2. See napariTFM.backend.bayesian_l2.
+            from src.napariTFM.bayesian_l2 import reconstruct_bl2_frame
+            m = None if mask is None else _mask_frame_for_grid(mask, frame, force_shape[:2])
+            # Per-frame ? re-infer ? each frame (lam=None); otherwise reuse the frozen ?. The
+            # freeze button sets both (bayesian_per_frame=False + bayesian_lambda=<value>).
+            lam = None if getattr(params, "bayesian_per_frame", True) else getattr(
+                params, "bayesian_lambda", None)
+            traction = reconstruct_bl2_frame(
+                displacement_field[frame], params.young_modulus,
+                params.poisson_ratio_substrate,
+                params.pixel_size * params.downscale_factor, mask=m, lam=lam)
+            force_stack[frame, ..., 0] = traction[0]
+            force_stack[frame, ..., 1] = traction[1]
+        else:
+            result = calculator.calculate_traction(
+                displacements=displacement_field[frame],
+                pixel_size=params.pixel_size,
+                downscale_factor=params.downscale_factor,
+                # auto_gcv ? None asks calculate_traction to pick ? by GCV on this frame;
+                # otherwise the manual (or frozen) ? is used verbatim.
+                regularization=None if params.auto_gcv else params.regularization,
+            )
+            force_stack[frame, ..., 0] = result[1][0]
+            force_stack[frame, ..., 1] = result[1][1]
+
+        _apply_force_clip(force_stack[frame], mask, frame, params)
+        yield force_stack[frame].copy(), frame + 1, total_frames
+
+    physical_scale = {
+        'pixel_size': params.pixel_size,
+        'grid_spacing': params.pixel_size * params.downscale_factor,
+        'time_interval': params.frame_interval,
+        'force_units': 'Pa',
+        'grid_spacing_units': 'µm',
+        'time_interval_units': 'min',
+    }
+
+    return FTTCResult(
+        force_field=force_stack,
+        original_shape=displacement_field.shape[1:3],
+        force_shape=force_stack.shape[1:3],
+        parameters=params,
+        physical_scale=physical_scale,
+    )
+
+
+def find_bayesian_regularization(displacement_field: np.ndarray, params: FTTCParameters,
+                                 mask: Optional[np.ndarray] = None) -> float:
+    """Estimate the Bayesian-L2 ridge ``?`` on one representative frame, to freeze and reuse.
+
+    The synchronous one-shot behind the Force stage's auto-? button. It runs the evidence
+    maximization of :mod:`napariTFM.backend.bayesian_l2` on the current frame and returns the
+    inferred ``? = ?/?``. Stored into ``params.bayesian_lambda``, that ? is then applied unchanged
+    to every frame of the experiment (the forward operator is identical across frames, so one ?
+    transfers exactly) -- keeping the regularization, and therefore the traction maps, comparable
+    frame to frame. Re-inferring ? per frame instead would let it drift with each frame's signal.
+
+    BL2 (? measured from the cell-free exterior) when a ``mask`` is given, ABL2 (? inferred)
+    otherwise. Returns the ridge ``?`` in the Bayesian-L2 operator's own units -- it belongs to
+    ``bayesian_lambda``, *not* the manual-FTTC ``regularization`` (a different, Fourier operator).
+    """
+    is_valid, error_msg = validate_fttc_parameters(params)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    is_valid, error_msg = validate_displacement_field(displacement_field)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    if displacement_field.ndim != 3:
+        raise ValueError("Optimal regularization requires one 3D displacement frame")
+
+    from src.napariTFM.bayesian_l2 import estimate_bayesian_lambda
+    return estimate_bayesian_lambda(
+        displacement_field, params.young_modulus, params.poisson_ratio_substrate,
+        params.pixel_size * params.downscale_factor, mask=mask)
+
+
+def find_gcv_regularization(displacement_field: np.ndarray, params: FTTCParameters) -> float:
+    """Pick the Tikhonov ``?`` for one frame by Generalized Cross-Validation (GCV).
+
+    The synchronous one-shot behind the FTTC+GCV method's auto-? button. Unlike the Bayesian
+    estimate, this ? is for the *Fourier* FTTC operator -- the same scalar the manual
+    ``regularization`` slider sets -- so the button writes it straight back into that slider,
+    where it stays editable. (The per-frame ``auto_gcv`` checkbox re-picks it each frame instead,
+    via ``regularization=None`` in :meth:`FTTC.calculate_traction`.)
+    """
+    is_valid, error_msg = validate_fttc_parameters(params)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    is_valid, error_msg = validate_displacement_field(displacement_field)
+    if not is_valid:
+        raise ValueError(error_msg)
+
+    if displacement_field.ndim != 3:
+        raise ValueError("Optimal regularization requires one 3D displacement frame")
+
+    shape = displacement_field.shape[:-1]
+    pos = np.array(np.meshgrid(np.arange(shape[1]), np.arange(shape[0]), indexing='xy'))
+    vec = np.array([displacement_field[..., 0], displacement_field[..., 1]])
+    return FTTC(params)._find_regularization(
+        pos, vec, params.pixel_size * params.downscale_factor, shape[1], shape[0])
+
+
+class FTTC:
+    def __init__(self, params: FTTCParameters):
+        """Initialize FTTC calculator with substrate properties and calculation parameters.
+
+        Args:
+            params (FTTCParameters): Configuration object containing:
+                - young_modulus (float): Young's modulus of the substrate in Pascals (Pa)
+                - poisson_ratio_substrate (float): Poisson ratio of the substrate
+                - gel_height (float, optional): Gel height in micrometers for finite thickness
+                    correction. Use None for infinite thickness.
+
+        Example:
+            >>> fttc = FTTC(FTTCParameters(
+            ...     young_modulus=10000,  # 10 kPa
+            ...     poisson_ratio_substrate=0.5,
+            ...     gel_height=None  # infinite thickness
+            ... ))
+        """
+        self.E = params.young_modulus
+        self.nu = params.poisson_ratio_substrate
+        # 0 is the UI/config sentinel for "infinite thickness" (ParameterManager
+        # flattens gel_height=None to 0 when serializing to a plain dict/YAML,
+        # e.g. for batch configs, but never converts it back). A gel height of
+        # exactly 0 is otherwise physically meaningless, and the finite-
+        # thickness correction below divides by tanh(kh), which is 0 when
+        # kh == 0 -- so leaving it as 0 here would produce all-NaN forces.
+        self.gel_height = params.gel_height if params.gel_height else None
+
+
+    def calculate_traction(self, displacements: Tuple[np.ndarray, np.ndarray],
+                           pixel_size: float,
+                           downscale_factor: int = 1,
+                           regularization: float = None) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
+        """
+        Calculate traction forces from displacement field measurements using Fourier Transform
+        Traction Cytometry (FTTC).
+
+        Parameters
+        ----------
+        displacements : np.ndarray (shape: H x W x 2)
+            - dx: x-direction displacements (shape: H x W, displacements[..., 0])
+            - dy: y-direction displacements (shape: H x W, displacements[..., 1])
+            Units: micrometers (?m)
+            The displacement fields should represent how far each point in the gel
+            has moved from its original position.
+
+        pixel_size : float
+            Physical size of each pixel in the displacement field.
+            Units: micrometers (?m)
+            Example: for a 100x objective with 0.1 ?m/pixel, use 0.1
+
+        downscale_factor : int
+            Factor representing the spatial downsampling that was already applied
+            to the displacement field data before being passed to this function.
+            This is used to correctly scale the pixel size for force calculations.
+
+        regularization : float
+            Tikhonov regularization parameter (?) for the inverse problem.
+            Units: dimensionless
+            Typical values range from 1e-6 to 1e-3.
+            Higher values give smoother force fields but may underestimate peak forces.
+
+        Returns
+        -------
+        Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]
+            Returns ((x, y), forces) where:
+
+            x, y : np.ndarray
+                2D coordinate grids (shape: H x W each) giving the physical position
+                corresponding to each point in the force field.
+                Units: micrometers (?m)
+                These can be used for plotting or further analysis.
+
+            forces : np.ndarray
+                Calculated traction forces (shape: 2 x H x W)
+                - forces[0]: x-direction forces
+                - forces[1]: y-direction forces
+                Units: N/m² (Pascals)
+                These represent the forces exerted by the cell on the substrate
+                at each point.
+
+        Notes
+        -----
+        The calculation involves several steps:
+        1. Fourier transform of the displacement field
+        2. Application of the Green's function to calculate forces
+        3. Inverse Fourier transform to get the final force field
+
+        The relationship between forces and displacements is given by the
+        Boussinesq solution in Fourier space, modified by the Tikhonov
+        regularization parameter to handle noise in the measurements.
+
+        The output force field will have exactly the same dimensions as the
+        input displacement field to ensure dimensional consistency.
+
+        Examples
+        --------
+        >> fttc = FTTC(E=10000, nu=0.5)  # Initialize with gel properties
+        >> # dx and dy are already in micrometers
+        >> worker = fttc.calculate_traction(
+        ...     displacements=(dx, dy),
+        ...     pixelsize=0.1,  # 0.1 ?m per pixel
+        ...     downscale_factor=4  # if data was previously downsampled by factor of 4
+        ... )
+        >> # Set up callbacks
+        >> def handle_result(result):
+        ...     (x, y), forces = result
+        ...     force_magnitude = np.sqrt(forces[0]**2 + forces[1]**2)
+        ...     # Process the results here
+        >> worker.returned.connect(handle_result)
+        >> worker.start()
+        """
+        d_x = displacements[..., 0]
+        d_y = displacements[..., 1]
+
+        # Preserve exact input dimensions throughout the calculation
+        input_height, input_width = d_x.shape
+
+        # Create coordinate grid matching input dimensions exactly
+        x = np.arange(input_width)
+        y = np.arange(input_height)
+
+        # Create position array in pixel coordinates
+        pos = np.array([np.ones(len(y))[:, None] * x,
+                        y[:, None] * np.ones(len(x))])
+
+        # Create displacement vector array, already in physical units
+        vec = np.array([d_x.flatten(), d_y.flatten()])
+
+        # Convert pixel coordinates to physical units inside _perform_tfm
+        forcemap_pixel_size = pixel_size * downscale_factor
+
+        # regularization=None is the GCV request: pick ? from the data by Generalized
+        # Cross-Validation on this frame (the FTTC+GCV method's auto-? path). A concrete
+        # value (manual, or a frozen GCV/Bayesian estimate) is used as-is.
+        if regularization is None:
+            regularization = self._find_regularization(
+                pos, vec, forcemap_pixel_size, input_width, input_height)
+
+        return self._perform_tfm(pos, vec, forcemap_pixel_size, regularization,
+                                 i_max=input_width, j_max=input_height)
+
+    def _perform_tfm(self, pos: np.ndarray, vec: np.ndarray,
+                     pixelsize: float, regularization: float,
+                     i_max: Optional[int] = None,
+                     j_max: Optional[int] = None) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
+        """
+        Core TFM calculation with exact dimension preservation.
+
+        Performs the complete Fourier Transform Traction Cytometry calculation
+        while preserving the exact input dimensions throughout the pipeline.
+
+        Args:
+            pos (np.ndarray): Position array in pixel coordinates (2, N)
+            vec (np.ndarray): Displacement vector array in physical units (2, N)
+            pixelsize (float): Effective pixel size in meters (including any downsampling)
+            regularization (float): Regularization parameter (lambda)
+            i_max (int, optional): Exact output grid width dimension
+            j_max (int, optional): Exact output grid height dimension
+
+        Returns:
+            Tuple containing:
+            - (x, y) coordinate grids in physical units, shape (j_max, i_max) each
+            - forces array in N/m², shape (2, j_max, i_max)
+
+        Note:
+            When i_max and j_max are specified, the output will have exactly
+            these dimensions, preserving the input displacement field size.
+            This prevents dimension mismatches in downstream processing.
+        """
+        # Interpolate to regular grid using exact input dimensions
+        grid_mat, u, i_max, j_max, _, _ = self._interp_vec2grid(
+            pos, vec, i_max=i_max, j_max=j_max)
+
+        # Calculate in Fourier space using physical units
+        kx, ky = self._calculate_fourier_modes(i_max, j_max, pixelsize)
+        GFt = self._calculate_greens_function(kx, ky)
+
+        G_inv = calculate_traction_2d(GFt, regularization ** 2)
+        G_inv_xx = G_inv[0, 0]
+        G_inv_xy = G_inv[0, 1]
+        G_inv_yy = G_inv[1, 1]
+
+        Ftfx, Ftfy = self._reg_fourier_TFM_L2(u, G_inv_xx, G_inv_xy, G_inv_yy)
+
+        # Calculate final forces
+        pos, vec, f = self._calculate_stress_field(
+            Ftfx, Ftfy, grid_mat, u, i_max, j_max)
+
+        # Convert output coordinates to physical units
+        x = np.reshape(pos[0], (i_max, j_max)).T * pixelsize
+        y = np.reshape(pos[1], (i_max, j_max)).T * pixelsize
+
+        # Create coordinate grids that exactly match the input dimensions
+        # No padding or cropping - dimensions are preserved exactly
+        x_full = np.linspace(x[0, 0], x[-1, -1], i_max)
+        y_full = np.linspace(y[0, 0], y[-1, -1], j_max)
+        x, y = np.meshgrid(x_full, y_full)
+
+        return (x, y), f
+
+    def _calculate_greens_function(self, kx: np.ndarray, ky: np.ndarray):
+        """Calculate Green's function in Fourier space with optional gel height correction.
+
+        Implements the Boussinesq solution modified for finite gel thickness when applicable.
+
+        Args:
+            kx (np.ndarray): x-component of wave vectors
+            ky (np.ndarray): y-component of wave vectors
+
+        Returns:
+            np.ndarray: Green's function tensor in Fourier space.
+                Shape: 2 × 2 × H × W complex array
+        """
+        V = 2 * (1 + self.nu) / self.E
+        kx_sq = kx ** 2
+        ky_sq = ky ** 2
+        kabs = np.sqrt(kx_sq + ky_sq)
+        kabs_sq = kx_sq + ky_sq
+
+        # Standard Green's function components
+        GFt_std = V * kabs ** (-3) * np.array([
+            [kabs_sq - self.nu * kx_sq, -self.nu * kx * ky],
+            [-self.nu * kx * ky, kabs_sq - self.nu * ky_sq]
+        ])
+        GFt_std[:, :, 0, 0] = 0.0
+
+        # Apply gel height correction if finite (not None and not infinity)
+        if self.gel_height is not None:
+            kh = kabs * self.gel_height
+            mask_standard = kh > 100  # Use standard for large kh
+
+            # Calculate finite thickness components
+            c = np.cosh(kh)
+
+            # Correction factor
+            gamma = ((3 - 4 * self.nu) +
+                     (((1 - 2 * self.nu) ** 2) / (c ** 2)) +
+                     ((kh ** 2) / (c ** 2))) / \
+                    ((3 - 4 * self.nu) * np.tanh(kh) + kh / (c ** 2))
+
+            # Apply correction while handling numerical stability
+            gamma[mask_standard] = 1.0
+            gamma[0, 0] = 1.0  # Handle k=0 case
+
+            # Apply correction to all components
+            GFt = np.empty_like(GFt_std)
+            for i in range(2):
+                for j in range(2):
+                    GFt[i, j] = GFt_std[i, j] * gamma
+
+            return GFt
+
+        return GFt_std
+
+
+    def _interp_vec2grid(self, pos: np.ndarray, vec: np.ndarray,
+                         i_max: Optional[int] = None, j_max: Optional[int] = None):
+        """Interpolate scattered displacement data to a regular grid using KD-tree.
+
+        Implements efficient nearest-neighbor interpolation with inverse distance
+        weighting for smooth results.
+
+        Args:
+            pos (np.ndarray): Position array in pixel coordinates (2 × N)
+            vec (np.ndarray): Vector values to interpolate (2 × N)
+            i_max (int, optional): Output grid x-dimension
+            j_max (int, optional): Output grid y-dimension
+
+        Returns:
+            Tuple containing:
+            - grid_mat (np.ndarray): Regular grid coordinates (2 × H × W)
+            - u (np.ndarray): Interpolated values on grid (2 × H × W)
+            - i_max (int): Actual x-dimension used
+            - j_max (int): Actual y-dimension used
+            - i_bound_size (int): Always 0 (kept for compatibility)
+            - j_bound_size (int): Always 0 (kept for compatibility)
+
+        Note:
+            If i_max/j_max not provided, determines dimensions from data extent.
+            Uses adaptive number of neighbors (up to 12) for interpolation.
+        """
+        from scipy.spatial import cKDTree
+
+        # Calculate grid dimensions
+        max_corner = np.array([np.max(pos[0]), np.max(pos[1])])
+        min_corner = np.array([np.min(pos[0]), np.min(pos[1])])
+
+        if i_max is None and j_max is None:
+            i_max = np.round((max_corner[0] - min_corner[0]))
+            j_max = np.round((max_corner[1] - min_corner[1]))
+            i_max -= np.int64(np.mod(i_max, 2))
+            j_max -= np.int64(np.mod(j_max, 2))
+
+        i_max, j_max = np.int64(i_max), np.int64(j_max)
+
+        # Create target grid points
+        x = min_corner[0] + np.arange(0.5, i_max, 1)
+        y = min_corner[1] + np.arange(0.5, j_max, 1)
+        X, Y = np.meshgrid(x, y)
+        grid_mat = np.array([X, Y])
+
+        # Prepare source points and values
+        source_points = np.column_stack((pos[0].ravel(), pos[1].ravel()))
+        values = np.column_stack((vec[0].ravel(), vec[1].ravel()))
+
+        # Remove NaN values
+        valid_mask = ~np.isnan(values).any(axis=1)
+        valid_points = source_points[valid_mask]
+        valid_values = values[valid_mask]
+
+        # Create KD-tree for efficient nearest neighbor search
+        tree = cKDTree(valid_points)
+
+        # Prepare target points
+        target_points = np.column_stack((X.ravel(), Y.ravel()))
+
+        # Initialize output arrays
+        u = np.empty((2, *X.shape), dtype=np.float64)
+
+        # Find k nearest neighbors for each target point
+        k = min(12, len(valid_points))  # Adjust k based on available points
+        distances, indices = tree.query(target_points, k=k)
+
+        # Convert distances to weights using inverse distance weighting
+        weights = 1.0 / (distances + np.finfo(float).eps)  # Add eps to avoid division by zero
+        weights_sum = np.sum(weights, axis=1, keepdims=True)
+        normalized_weights = weights / weights_sum
+
+        # Compute weighted average of values
+        weighted_values = np.sum(valid_values[indices] * normalized_weights[..., np.newaxis], axis=1)
+
+        # Reshape results
+        u[0] = weighted_values[:, 0].reshape(X.shape)
+        u[1] = weighted_values[:, 1].reshape(X.shape)
+
+        # Handle edge cases where interpolation might fail
+        if np.any(np.isnan(u)):
+            # Fall back to nearest neighbor for any remaining NaN values
+            nan_mask = np.isnan(u[0]) | np.isnan(u[1])
+            if np.any(nan_mask):
+                flat_indices = nan_mask.ravel()
+                _, nearest_indices = tree.query(target_points[flat_indices], k=1)
+                u[0].ravel()[flat_indices] = valid_values[nearest_indices, 0]
+                u[1].ravel()[flat_indices] = valid_values[nearest_indices, 1]
+
+        return grid_mat, u, i_max, j_max, 0, 0
+
+    def _calculate_fourier_modes(self, i_max: int, j_max: int, forcemap_pixel_size: float):
+        """Calculate the Fourier modes (angular wavenumbers) on the FFT grid."""
+        # np.fft.fftfreq gives the correct frequency ordering for *both* even and odd
+        # lengths; the previous hand-rolled `arange(0, n//2), arange(-n//2, 0)` matched
+        # fftfreq only for even n and mislabelled the Nyquist-adjacent bin for odd n
+        # (e.g. n=5 ? [0,1,-3,-2,-1] instead of [0,1,2,-2,-1]), silently corrupting the
+        # Green's function on odd-sized grids.
+        kx_vec = 2. * np.pi / forcemap_pixel_size * np.fft.fftfreq(int(i_max))
+        ky_vec = 2. * np.pi / forcemap_pixel_size * np.fft.fftfreq(int(j_max))
+        kx, ky = np.meshgrid(kx_vec, ky_vec)
+
+        kx[0, 0] = 1
+        ky[0, 0] = 1
+        return kx, ky
+
+    def _reg_fourier_TFM_L2(self, u: np.ndarray, Ginv_xx: np.ndarray,
+                            Ginv_xy: np.ndarray, Ginv_yy: np.ndarray):
+        """Calculate Fourier transformed traction field"""
+        Ftux = np.fft.fft2(u[0])
+        Ftuy = np.fft.fft2(u[1])
+        Ftfx = Ginv_xx * Ftux + Ginv_xy * Ftuy
+        Ftfy = Ginv_xy * Ftux + Ginv_yy * Ftuy
+        return Ftfx, Ftfy
+
+    def _calculate_stress_field(self, Ftfx: np.ndarray, Ftfy: np.ndarray,
+                                grid_mat: np.ndarray, u: np.ndarray,
+                                i_max: int, j_max: int):
+        """Calculate stress field and related quantities"""
+        fx = np.fft.ifft2(Ftfx)
+        fy = np.fft.ifft2(Ftfy)
+
+        pos = np.array([
+            np.reshape(grid_mat[0], (i_max * j_max)),
+            np.reshape(grid_mat[1], (i_max * j_max)),
+        ])
+        vec = np.array([
+            np.reshape(u[0], (i_max * j_max)),
+            np.reshape(u[1], (i_max * j_max))
+        ])
+
+        f = np.array([np.real(fx), np.real(fy)])
+
+        return pos, vec, f
+
+    # --- Generalized Cross-Validation (GCV) automatic ? selection ---------------------
+    # Hansen, Regularization Tools 4.0 (gcv.m / gcvfun.m); Golub, Heath & Wahba,
+    # Generalized Cross-Validation as a Method for Choosing a Good Ridge Parameter,
+    # Technometrics 21:215 (1979). GCV picks the Tikhonov ? for the *Fourier* FTTC
+    # operator directly (unlike Bayesian evidence, which lives in real space); its ? is
+    # the same scalar the manual slider sets, so the FTTC+GCV button can fill the slider.
+
+    def _svd_block(self, pos: np.ndarray, vec: np.ndarray, forcemap_pixel_size: float,
+                   i_max: int = None, j_max: int = None):
+        """Per-Fourier-mode SVD of the FTTC problem, as GCV consumes it.
+
+        Returns the block-diagonal left singular vectors ``U_h`` (M·N, 2, 2), the flattened
+        singular values ``s_h`` (2·M·N,), and the flattened Fourier transform of the gridded
+        displacement ``Ftu`` (2·M·N,). Exact input dimensions are preserved throughout.
+        """
+        grid_mat, u, i_max, j_max, _, _ = self._interp_vec2grid(pos, vec, i_max=i_max, j_max=j_max)
+        kx, ky = self._calculate_fourier_modes(i_max, j_max, forcemap_pixel_size)
+        GFt = self._calculate_greens_function(kx, ky)
+
+        Ftu = np.fft.fft2(u).reshape(2, -1).T
+        shape = GFt[0, 0].shape
+
+        U_h = np.empty((shape[0] * shape[1], 2, 2), dtype=np.complex128)
+        s_h = np.empty((shape[0] * shape[1], 2))
+        for i in range(shape[0]):
+            for j in range(shape[1]):
+                idx = i * shape[1] + j
+                U_h[idx, :], s_h[idx, :], _ = np.linalg.svd(GFt[:, :, i, j])
+
+        return U_h, s_h.flatten(), Ftu.flatten()
+
+    @staticmethod
+    def _gcvfun(lmbda, s2, beta, delta0, mn):
+        """Auxiliary routine for GCV calculation (Hansen's gcvfun)."""
+        f = (lmbda ** 2) / (s2 + lmbda ** 2)
+        G = (np.linalg.norm(f * beta) ** 2 + delta0) / (mn + np.sum(f)) ** 2
+        return G
+
+    def _gcv_blockdiag(self, U: np.ndarray, s: np.ndarray, b: np.ndarray,
+                       lambdarange: np.ndarray) -> float:
+        """Return the GCV-optimal regularization for the block-diagonal system."""
+        npoints = lambdarange.size
+        beta = blkmul_adj(U, b)
+
+        reg_param = np.copy(lambdarange)
+        G = np.zeros(npoints)
+        s2 = s ** 2
+
+        for i in range(npoints):
+            G[i] = self._gcvfun(reg_param[i], s2, beta[:s.size], 0., 0)
+
+        minGi = G.argmin(0)
+        reg_min = optimize.fmin(
+            self._gcvfun,
+            x0=reg_param[np.max([minGi, 0])],
+            args=(s2, beta[:s.size], 0., 0),
+            disp=0,
+        )[0]
+
+        return float(reg_min)
+
+    def _find_regularization(self, pos0: np.ndarray, vec0: np.ndarray,
+                             forcemap_pixel_size: float, input_width: int,
+                             input_height: int) -> float:
+        """Find the optimal Tikhonov ? by Generalized Cross-Validation (GCV).
+
+        The search range is centred on ? = 0.2/E with a span of ±5 orders of magnitude,
+        where E is Young's modulus, over 50 log-spaced points refined by ``optimize.fmin``.
+        Exact input dimensions are preserved throughout.
+        """
+        lamguess = 0.2 / self.E
+        lamlow = np.log10(lamguess) - 5.0
+        lamhigh = np.log10(lamguess) + 5.0
+        lambdarange = np.logspace(lamlow, lamhigh, 50)
+
+        blockU, s, b = self._svd_block(pos0, vec0, forcemap_pixel_size,
+                                       i_max=input_width, j_max=input_height)
+        reg_min = self._gcv_blockdiag(blockU, s, b, lambdarange)
+        # _gcvfun depends on lambda only via lambda**2, so the unconstrained optimizer can
+        # settle on a negative root numerically identical to its magnitude. The force path
+        # squares it, but the raw value is stored as `regularization` and later hits
+        # math.log10() in the UI, which rejects negatives. Return the magnitude ? lossless.
+        return abs(reg_min)
